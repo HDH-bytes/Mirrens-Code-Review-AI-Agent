@@ -1,136 +1,86 @@
 # AI Code Review Agent
 
-Agent that listens to GitHub PR webhooks, parses diffs with Python's `ast` module to extract function signatures and complexity, and posts per-function inline review comments via the GitHub REST API. Claude's output is forced through a JSON schema and validated against AST-derived line ranges, so hallucinated line numbers never reach GitHub. Review history and per-repo config live in Postgres.
+A Claude-powered code reviewer for GitHub PRs. Listens for webhooks, parses the diff with Python's ast module to pull out the changed functions, asks Claude to review them, and posts inline comments back on the PR.
+The trick: Claude's output is locked to a JSON schema via tool_use, and every line number it returns is checked against the function's actual line range before anything hits GitHub. No made-up line numbers. No comments on code that doesn't exist.
+What it does
 
-## How it works
+GitHub fires a webhook when a PR opens or gets a new push.
+Server verifies the HMAC signature, queues the review, and 200s back fast (GitHub retries anything over ~10s).
+Reviewer pulls the diff, figures out which Python functions changed, and sends them to Claude with a strict schema.
+Any finding whose line number falls outside the function's actual range gets dropped on the floor.
+The rest get posted as inline review comments.
+Everything lands in Postgres so we can spot when the same bug pattern keeps showing up in the same function.
 
-```
-GitHub PR webhook
-      |
-      v
-  FastAPI /webhooks/github
-      |   (HMAC-SHA256 sig check)
-      |   (background task)
-      v
-  reviewer.review_pr
-      |
-      +-- fetch_pr_diff
-      +-- parse_diff (unidiff) --------> changed lines per .py file
-      +-- fetch_file_at_commit
-      +-- ast_analyzer.analyze --------> funcs + line ranges + complexity
-      +-- functions_touched_by_lines --> only changed funcs
-      +-- claude_client.review_functions
-      |     - submit_review tool_use schema (forced)
-      |     - post-hoc: drop findings whose line is outside the func range
-      +-- github_client.post_review_comment
-      +-- postgres: repositories, reviews, review_comments
-```
-
-The range check in `claude_client.review_functions` is what enforces "no false-positive placements." Schema keeps the shape locked; runtime check keeps the line numbers real.
-
-## Repo layout
-
-```
-app/
-  main.py                 # FastAPI + webhook + HMAC
-  config.py               # pydantic settings
-  analyzers/
-    ast_analyzer.py       # func extraction + mccabe
-    diff_parser.py        # unified diff -> changed lines
-  services/
-    claude_client.py      # anthropic SDK, tool_use schema, range check
-    github_client.py      # PR diff, file at commit, inline comments
-    reviewer.py           # orchestrator
-  db/
-    models.py             # sqlalchemy models
-    session.py
-    repository.py         # query helpers
-  schemas/review.py       # pydantic models
-sample_prs/               # a broken file + its diff for local testing
-scripts/
-  test_review_locally.py  # CLI runner, no github needed
-tests/
-  test_ast_analyzer.py
-  test_diff_parser.py
-schema.sql
-docker-compose.yml
-Dockerfile
-requirements.txt
-```
-
-## Setup
-
-```bash
-cp .env.example .env
+Running it
+bashcp .env.example .env
 # fill in ANTHROPIC_API_KEY, GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET
 
-docker compose up -d db
-docker compose up app
-```
-
-Postgres schema applies on first startup via `schema.sql`.
-
-## Tests
-
-```bash
-pip install -r requirements.txt
-PYTHONPATH=. pytest tests/ -v
-```
-
-15 tests cover function extraction, signatures, complexity math, line ranges, syntax-error handling, the touched-function filter, and diff parsing.
-
-## Local dry run
-
-`scripts/test_review_locally.py` runs the full pipeline (analysis + Claude + validation) and prints findings instead of posting them.
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-... \
-  PYTHONPATH=. python scripts/test_review_locally.py \
+docker compose up
+Postgres spins up with the schema applied. App's on localhost:8000.
+Trying it without GitHub
+Don't want to set up ngrok just to see it work? There's a local runner that skips the webhook and just prints findings:
+bashANTHROPIC_API_KEY=sk-ant-... PYTHONPATH=. \
+  python scripts/test_review_locally.py \
   sample_prs/example.py sample_prs/example.diff
-```
+The sample file has a SQL injection, a 4-deep nested if, and an eval() on file contents. Claude should flag all three.
+Tests
+bashpip install -r requirements.txt
+PYTHONPATH=. pytest
+15 tests. Most of them pin down the AST analyzer: function extraction (top-level, methods, nested, async), signature formatting, complexity math across different branching constructs, line range accuracy, and graceful handling of syntax errors. The rest cover the diff parser.
+How it's wired
+github webhook
+     |
+     v
+/webhooks/github   (HMAC check, queue background task, 200)
+     |
+     v
+reviewer.review_pr
+     |
+     +-- fetch PR diff from github
+     +-- parse_diff -> changed lines per .py file
+     +-- fetch each file at head_sha
+     +-- ast_analyzer.analyze -> funcs with line ranges + complexity
+     +-- keep only funcs touched by the diff
+     +-- claude with submit_review tool (schema enforced)
+     +-- drop findings outside func ranges
+     +-- post inline comments via github REST
+     +-- log everything to postgres
+Three tables:
 
-The sample file has a SQL injection, a 4-deep nested if, and an `eval()` of file contents. All three should come back as high-severity findings.
+repositories holds per-repo settings (enabled, min severity, disabled categories).
+reviews is one row per (repo, PR, head_sha). The unique constraint gives you idempotency on force-push.
+review_comments is every inline comment the bot ever posted, indexed on (function_name, category). That index is what powers the "this function has been flagged for the same thing 3 times before" note the bot appends when a pattern repeats.
 
-## Wiring up a real webhook
+Wiring up a real webhook
 
-1. Expose the app publicly (ngrok, Cloudflare Tunnel, or a deployment).
-2. Repo Settings -> Webhooks:
-   - Payload URL: `https://<host>/webhooks/github`
-   - Content type: `application/json`
-   - Secret: same value as `GITHUB_WEBHOOK_SECRET`
-   - Events: "Pull requests" only
-3. `GITHUB_TOKEN` needs `repo` scope (PAT) or a GitHub App token with `pull_requests: write` + `contents: read`.
+Expose the app publicly. ngrok or a Cloudflare Tunnel is easiest for local testing.
+Go to the repo's Settings -> Webhooks and add:
 
-Handler only acts on `opened`, `synchronize`, `reopened`. `ping` returns pong. Everything else returns ignored.
+URL: https://<your-host>/webhooks/github
+Content type: application/json
+Secret: same string as GITHUB_WEBHOOK_SECRET in your .env
+Events: Pull requests only
 
-## Per-repo config
 
-Rows in `repositories` are created lazily on first PR:
+GITHUB_TOKEN needs the repo scope (PAT), or use a GitHub App token with pull_requests: write + contents: read.
 
-| column                | effect                                                      |
-| --------------------- | ----------------------------------------------------------- |
-| `enabled`             | false = mute the bot on this repo                           |
-| `min_severity`        | low / medium / high, filters out lower findings             |
-| `disabled_categories` | e.g. `{'style'}` to drop style findings entirely            |
+The handler only acts on opened, synchronize, and reopened. Pings get a pong.
+Per-repo config
+First time a PR comes in from a repo, a row is created in repositories with defaults. Tweak those rows to change behavior without redeploying:
 
-## Regression patterns
+Set enabled = false to mute the bot.
+Bump min_severity to high if you're tired of low-severity noise.
+Add categories to disabled_categories to drop them entirely. I usually toss style in there since linters cover it.
 
-Every posted comment is persisted with `function_name` and `category`. Before posting a new one, the orchestrator counts prior hits on that pair and, if non-zero, appends a note:
+Things I didn't get to
 
-> _Note: `security` issues have been flagged on `get_user_by_email` 3 time(s) before in this repo._
+Python only. The ast module is Python-specific. JS/TS would mean swapping in tree-sitter.
+FastAPI BackgroundTasks is fine for low volume. If this ever sees real traffic, it wants Celery or RQ with a Redis broker.
+The PAT auth path works for one user. Multi-org needs a GitHub App with installation tokens.
+McCabe only. Cognitive complexity would be a better signal but I wanted to ship the MVP first.
 
-The `(function_name, category)` index on `review_comments` keeps this cheap.
+Security notes
 
-## Security notes
-
-- Never commit `.env`. The `.gitignore` excludes it.
-- `docker-compose.yml` uses `postgres:postgres` for local dev only. The port is mapped to `localhost:5433`, not exposed to the network. For any deployment, swap these for real secrets.
-- Webhook endpoint rejects unsigned and wrongly-signed requests with 401. Don't disable that check.
-- `GITHUB_TOKEN` has write access to PR comments. Store it in your deployment secrets, not in the repo.
-
-## Known limitations
-
-- Python only. AST module is Python-specific. JS/TS would need tree-sitter.
-- `BackgroundTasks` is fine for low volume. For real traffic, move to Celery/RQ + Redis.
-- PAT path is fine for a single user. Multi-org = GitHub App with installation tokens.
-- McCabe only. Cognitive complexity would be a nice addition.
+.gitignore excludes .env. Don't commit secrets.
+The Postgres creds in docker-compose.yml are local-dev defaults and the port is only bound to localhost. Swap them if you deploy this anywhere.
+The webhook handler 401s any request with a bad or missing signature. Don't disable that check.
