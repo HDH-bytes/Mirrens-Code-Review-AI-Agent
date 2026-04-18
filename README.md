@@ -106,6 +106,3 @@ First time a PR comes in from a repo, a row is created in `repositories` with de
 - The Postgres creds in `docker-compose.yml` are local-dev defaults and the port is only bound to localhost. Swap them if you deploy this anywhere.
 - The webhook handler 401s any request with a bad or missing signature. Don't disable that check.
 
-## License
-
-MIT.
